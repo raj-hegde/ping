@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"os/signal"
 	"syscall"
 	"time"
 )
@@ -16,6 +17,12 @@ type icmp struct {
 	icmp_id       uint16
 	icmp_seq      uint16
 	icmp_data     []byte
+}
+
+type PingStats struct {
+	Transmitted int
+	Received    int
+	TotalTime   time.Duration
 }
 
 func (i *icmp) Seriliaze() []byte {
@@ -56,6 +63,11 @@ func (i *icmp) calculateCheckSum(buf []byte) uint16 {
 }
 
 func main() {
+	stats := &PingStats{}
+	sigChan := make(chan os.Signal, 1)
+
+	signal.Notify(sigChan, syscall.SIGINT)
+
 	if len(os.Args) < 2 {
 		fmt.Println("Usage: sudo go run main.go <target_ip>")
 		return
@@ -87,6 +99,23 @@ func main() {
 		icmp_id:   uint16(os.Getpid() & 0xffff),
 		icmp_data: []byte("Mechanical sympathy"),
 	}
+
+	go func() {
+		<-sigChan
+
+		fmt.Printf("\n--- PING Statistics ---\n")
+		fmt.Printf("%d packets transmitted, %d received\n", stats.Transmitted, stats.Received)
+
+		if stats.Transmitted > 0 {
+			loss := ((stats.Transmitted - stats.Received) * 100) / stats.Transmitted
+			fmt.Printf("%d%% packet loss\n", loss)
+		}
+		if stats.Received > 0 {
+			avg := stats.TotalTime / time.Duration(stats.Received)
+			fmt.Printf("Average Round-Trip Time: %v\n", avg)
+		}
+		os.Exit(0)
+	}()
 	fmt.Printf("PING %s...\n", targetIP.String())
 
 	for seq := 1; ; seq++ {
@@ -99,6 +128,7 @@ func main() {
 			fmt.Printf("failed to send packet: %v\n", err)
 			return
 		}
+		stats.Transmitted++
 
 		replybuf := make([]byte, 1024)
 		n, from, err := syscall.Recvfrom(fd, replybuf, 0)
@@ -107,6 +137,8 @@ func main() {
 			return
 		}
 		duration := time.Since(startTime)
+		stats.Received++
+		stats.TotalTime += duration
 
 		ipHeaderLength := int(replybuf[0]&0x0F) * 4
 		icmpBytes := replybuf[ipHeaderLength:n]
