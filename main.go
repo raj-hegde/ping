@@ -63,11 +63,6 @@ func (i *icmp) calculateCheckSum(buf []byte) uint16 {
 }
 
 func main() {
-	stats := &PingStats{}
-	sigChan := make(chan os.Signal, 1)
-
-	signal.Notify(sigChan, syscall.SIGINT)
-
 	if len(os.Args) < 2 {
 		fmt.Println("Usage: sudo go run main.go <target_ip>")
 		return
@@ -75,8 +70,25 @@ func main() {
 
 	targetIP := net.ParseIP(os.Args[1]).To4()
 	if targetIP == nil {
-		fmt.Println("Invalid Ipv4 address")
-		return
+		fmt.Printf("Resolving domain %s...\n", os.Args[1])
+
+		ips, err := net.LookupIP(os.Args[1])
+		if err != nil {
+			fmt.Printf("Failed to resolve host %s: %v\n", os.Args[1], err)
+			return
+		}
+
+		for _, ip := range ips {
+			if ipv4 := ip.To4(); ipv4 != nil {
+				targetIP = ipv4
+				break
+			}
+		}
+
+		if targetIP == nil {
+			fmt.Println("Domain was resolved but no IPV4 address found.")
+			return
+		}
 	}
 
 	fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_RAW, syscall.IPPROTO_ICMP)
@@ -86,6 +98,10 @@ func main() {
 	}
 	defer syscall.Close(fd)
 
+	stats := &PingStats{}
+	sigChan := make(chan os.Signal, 1)
+
+	signal.Notify(sigChan, syscall.SIGINT)
 	var addr [4]byte
 	copy(addr[:], targetIP)
 	sockAddr := &syscall.SockaddrInet4{
