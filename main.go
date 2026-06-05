@@ -13,39 +13,33 @@ type icmp struct {
 	icmp_type     uint8
 	icmp_code     uint8
 	icmp_checksum uint16
+	icmp_id       uint16
+	icmp_seq      uint16
 	icmp_data     []byte
 }
 
-func newICMP(packetType uint8, code uint8, data []byte) []byte {
-	pkt := &icmp{
-		icmp_type: packetType,
-		icmp_code: code,
-		icmp_data: data,
-	}
-	pkt.icmp_checksum = pkt.calculateCheckSum()
+func (i *icmp) Seriliaze() []byte {
 	// RFC 792
+	rawBytes := make([]byte, 8+len(i.icmp_data))
 
-	rawBytes := make([]byte, 4+len(pkt.icmp_data))
-	rawBytes[0] = pkt.icmp_type
-	rawBytes[1] = pkt.icmp_code
-	binary.BigEndian.PutUint16(rawBytes[2:4], uint16(pkt.icmp_checksum))
-	copy(rawBytes[4:], pkt.icmp_data)
+	rawBytes[0] = i.icmp_type
+	rawBytes[1] = i.icmp_code
+	binary.BigEndian.PutUint16(rawBytes[4:6], i.icmp_id)
+	binary.BigEndian.PutUint16(rawBytes[6:8], i.icmp_seq)
+	copy(rawBytes[8:], i.icmp_data)
+
+	i.icmp_checksum = i.calculateCheckSum(rawBytes)
+
+	binary.BigEndian.PutUint16(rawBytes[2:4], i.icmp_checksum)
 
 	return rawBytes
 }
 
-func (i *icmp) calculateCheckSum() uint16 {
-	buf := make([]byte, 4+len(i.icmp_data))
-
-	buf[0] = i.icmp_type
-	buf[1] = i.icmp_code
-	buf[2] = 0
-	buf[3] = 0
-
-	copy(buf[4:], i.icmp_data)
+func (i *icmp) calculateCheckSum(buf []byte) uint16 {
 
 	var sum uint32
 	length := len(buf)
+
 	for j := 0; j < length-1; j += 2 {
 		word := uint32(buf[j])<<8 | uint32(buf[j+1])
 		sum += word
@@ -80,8 +74,6 @@ func main() {
 	}
 	defer syscall.Close(fd)
 
-	packet := newICMP(8, 0, []byte("Mechanical sympathy"))
-
 	var addr [4]byte
 	copy(addr[:], targetIP)
 	sockAddr := &syscall.SockaddrInet4{
@@ -89,32 +81,52 @@ func main() {
 		Addr: addr,
 	}
 
-	startTime := time.Now()
-	err = syscall.Sendto(fd, packet, 0, sockAddr)
-	if err != nil {
-		fmt.Printf("failed to send packet: %v\n", err)
-		return
+	packet := &icmp{
+		icmp_type: 8,
+		icmp_code: 0,
+		icmp_id:   uint16(os.Getpid() & 0xffff),
+		icmp_data: []byte("Mechanical sympathy"),
 	}
+	fmt.Printf("PING %s...\n", targetIP.String())
 
-	replybuf := make([]byte, 1024)
-	n, _, err := syscall.Recvfrom(fd, replybuf, 0)
-	if err != nil {
-		fmt.Println("Request timed out or host unreachable.")
-		return
+	for seq := 1; ; seq++ {
+		packet.icmp_seq = uint16(seq)
+		rawBytes := packet.Seriliaze()
+
+		startTime := time.Now()
+		err = syscall.Sendto(fd, rawBytes, 0, sockAddr)
+		if err != nil {
+			fmt.Printf("failed to send packet: %v\n", err)
+			return
+		}
+
+		replybuf := make([]byte, 1024)
+		n, from, err := syscall.Recvfrom(fd, replybuf, 0)
+		if err != nil {
+			fmt.Println("Request timed out or host unreachable.")
+			return
+		}
+		duration := time.Since(startTime)
+
+		ipHeaderLength := int(replybuf[0]&0x0F) * 4
+		icmpBytes := replybuf[ipHeaderLength:n]
+
+		if len(icmpBytes) < 8 {
+			fmt.Println("Malformed ICMP packet received")
+			return
+		}
+
+		responseType := icmpBytes[0]
+		responseCode := icmpBytes[1]
+		payload := icmpBytes[8:]
+
+		var srcIP string
+		if sockaddr, ok := from.(*syscall.SockaddrInet4); ok {
+			srcIP = fmt.Sprintf("%d.%d.%d.%d", sockaddr.Addr[0], sockaddr.Addr[1], sockaddr.Addr[2], sockaddr.Addr[3])
+		}
+
+		fmt.Printf("Reply from %s: seq=%d type=%d code=%d time=%d payload=%q\n",
+			srcIP, seq, responseType, responseCode, duration, string(payload))
+		time.Sleep(1 * time.Second)
 	}
-	duration := time.Since(startTime)
-	fmt.Printf("Packet received in %d with length %d\n", duration, n)
-	fmt.Println(string(replybuf))
-
-	// ipHeaderLength := int(replybuf[0]&0x0F) * 4
-	// icmpPayload := replybuf[ipHeaderLength:n]
-
-	// if len(icmpPayload) < 8 {
-	// 	fmt.Println("Malformed ICMP packer received")
-	// 	return
-	// }
-
-	// responseType := icmpPayload[0]
-	// responseCode := icmpPayload[1]
-
 }
