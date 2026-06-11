@@ -6,6 +6,8 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -24,6 +26,17 @@ type PingStats struct {
 	Received    int
 	TotalTime   time.Duration
 }
+
+type InFlightPacket struct {
+	TargetIP string
+	SentAt   time.Time
+}
+
+var (
+	flightTracker sync.Map
+	globalID      = uint16(os.Getpid() & 0xffff)
+	seqCounter    uint32 // Atomic counter
+)
 
 func (i *icmp) Seriliaze() []byte {
 	// RFC 792
@@ -68,29 +81,6 @@ func main() {
 		return
 	}
 
-	targetIP := net.ParseIP(os.Args[1]).To4()
-	if targetIP == nil {
-		fmt.Printf("Resolving domain %s...\n", os.Args[1])
-
-		ips, err := net.LookupIP(os.Args[1])
-		if err != nil {
-			fmt.Printf("Failed to resolve host %s: %v\n", os.Args[1], err)
-			return
-		}
-
-		for _, ip := range ips {
-			if ipv4 := ip.To4(); ipv4 != nil {
-				targetIP = ipv4
-				break
-			}
-		}
-
-		if targetIP == nil {
-			fmt.Println("Domain was resolved but no IPV4 address found.")
-			return
-		}
-	}
-
 	fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_RAW, syscall.IPPROTO_ICMP)
 	if err != nil {
 		fmt.Printf("Socket creation failed (Are you root?): %v\n", err)
@@ -100,21 +90,7 @@ func main() {
 
 	stats := &PingStats{}
 	sigChan := make(chan os.Signal, 1)
-
 	signal.Notify(sigChan, syscall.SIGINT)
-	var addr [4]byte
-	copy(addr[:], targetIP)
-	sockAddr := &syscall.SockaddrInet4{
-		Port: 0,
-		Addr: addr,
-	}
-
-	packet := &icmp{
-		icmp_type: 8,
-		icmp_code: 0,
-		icmp_id:   uint16(os.Getpid() & 0xffff),
-		icmp_data: []byte("Mechanical sympathy"),
-	}
 
 	go func() {
 		<-sigChan
@@ -132,49 +108,102 @@ func main() {
 		}
 		os.Exit(0)
 	}()
-	fmt.Printf("PING %s...\n", targetIP.String())
 
-	for seq := 1; ; seq++ {
-		packet.icmp_seq = uint16(seq)
+	stats.Transmitted++
+
+	go func() {
+		replybuf := make([]byte, 1500)
+		for {
+			n, from, err := syscall.Recvfrom(fd, replybuf, 0)
+			if err != nil {
+				fmt.Println("Request timed out or host unreachable.")
+				continue
+			}
+
+			recvTime := time.Now()
+			ipHeaderLength := int(replybuf[0]&0x0F) * 4
+			icmpBytes := replybuf[ipHeaderLength:n]
+
+			if len(icmpBytes) < 8 {
+				fmt.Println("Malformed ICMP packet received")
+				return
+			}
+
+			recvID := binary.BigEndian.Uint16(icmpBytes[4:6])
+			recvSeq := binary.BigEndian.Uint16(icmpBytes[6:8])
+
+			if recvID != globalID {
+				continue
+			}
+
+			if val, ok := flightTracker.Load(recvSeq); ok {
+				flight := val.(InFlightPacket)
+				flightTracker.Delete(recvSeq)
+				duration := recvTime.Sub(flight.SentAt)
+				stats.Received++
+				stats.TotalTime += duration
+				payload := icmpBytes[8:]
+
+				var srcIP string
+				if sockaddr, ok := from.(*syscall.SockaddrInet4); ok {
+					srcIP = fmt.Sprintf("%d.%d.%d.%d", sockaddr.Addr[0], sockaddr.Addr[1], sockaddr.Addr[2], sockaddr.Addr[3])
+				}
+
+				fmt.Printf("[REPLY] Found %-15s | rtt=%v data=%s", srcIP, duration, payload)
+			}
+		}
+	}()
+}
+
+func pingWorker(id int, fd int, jobs <-chan string, wg *sync.WaitGroup) {
+	defer wg.Done()
+
+	for target := range jobs {
+		targetIP := net.ParseIP(target).To4()
+		if targetIP == nil {
+			ips, err := net.LookupIP(target)
+			if err != nil {
+				fmt.Printf("[Worker %d] Failed to resolve host %s\n", id, target)
+				continue
+			}
+			for _, ip := range ips {
+				if ipv4 := ip.To4(); ipv4 != nil {
+					targetIP = ipv4
+					break
+				}
+			}
+		}
+		var addr [4]byte
+		copy(addr[:], targetIP)
+		sockAddr := &syscall.SockaddrInet4{
+			Port: 0,
+			Addr: addr,
+		}
+		seq := uint16(atomic.AddUint32(&seqCounter, 1) & 0xffff)
+
+		packet := &icmp{
+			icmp_type: 8,
+			icmp_code: 0,
+			icmp_id:   globalID,
+			icmp_seq:  seq,
+			icmp_data: []byte("Mechanical sympathy"),
+		}
+
 		rawBytes := packet.Seriliaze()
 
-		startTime := time.Now()
-		err = syscall.Sendto(fd, rawBytes, 0, sockAddr)
+		flightTracker.Store(seq, InFlightPacket{
+			TargetIP: targetIP.String(),
+			SentAt:   time.Now(),
+		})
+
+		fmt.Printf("PING %s...\n", targetIP.String())
+		fmt.Printf("[Worker %d] SEND -> %-15s (seq=%d)\n", id, targetIP.String(), seq)
+		err := syscall.Sendto(fd, rawBytes, 0, sockAddr)
 		if err != nil {
-			fmt.Printf("failed to send packet: %v\n", err)
-			return
-		}
-		stats.Transmitted++
-
-		replybuf := make([]byte, 1024)
-		n, from, err := syscall.Recvfrom(fd, replybuf, 0)
-		if err != nil {
-			fmt.Println("Request timed out or host unreachable.")
-			return
-		}
-		duration := time.Since(startTime)
-		stats.Received++
-		stats.TotalTime += duration
-
-		ipHeaderLength := int(replybuf[0]&0x0F) * 4
-		icmpBytes := replybuf[ipHeaderLength:n]
-
-		if len(icmpBytes) < 8 {
-			fmt.Println("Malformed ICMP packet received")
-			return
+			fmt.Printf("[Worker %d] Error sending to %s: %v\n", id, target, err)
+			flightTracker.Delete(seq)
 		}
 
-		responseType := icmpBytes[0]
-		responseCode := icmpBytes[1]
-		payload := icmpBytes[8:]
-
-		var srcIP string
-		if sockaddr, ok := from.(*syscall.SockaddrInet4); ok {
-			srcIP = fmt.Sprintf("%d.%d.%d.%d", sockaddr.Addr[0], sockaddr.Addr[1], sockaddr.Addr[2], sockaddr.Addr[3])
-		}
-
-		fmt.Printf("Reply from %s: seq=%d type=%d code=%d time=%d payload=%q\n",
-			srcIP, seq, responseType, responseCode, duration, string(payload))
-		time.Sleep(1 * time.Second)
+		time.Sleep(10 * time.Millisecond)
 	}
 }
