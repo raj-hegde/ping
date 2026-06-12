@@ -22,9 +22,9 @@ type icmp struct {
 }
 
 type PingStats struct {
-	Transmitted int
-	Received    int
-	TotalTime   time.Duration
+	Transmitted int64
+	Received    int64
+	TotalTime   int64
 }
 
 type InFlightPacket struct {
@@ -38,48 +38,13 @@ var (
 	seqCounter    uint32 // Atomic counter
 )
 
-func (i *icmp) Seriliaze() []byte {
-	// RFC 792
-	rawBytes := make([]byte, 8+len(i.icmp_data))
-
-	rawBytes[0] = i.icmp_type
-	rawBytes[1] = i.icmp_code
-	binary.BigEndian.PutUint16(rawBytes[4:6], i.icmp_id)
-	binary.BigEndian.PutUint16(rawBytes[6:8], i.icmp_seq)
-	copy(rawBytes[8:], i.icmp_data)
-
-	i.icmp_checksum = i.calculateCheckSum(rawBytes)
-
-	binary.BigEndian.PutUint16(rawBytes[2:4], i.icmp_checksum)
-
-	return rawBytes
-}
-
-func (i *icmp) calculateCheckSum(buf []byte) uint16 {
-
-	var sum uint32
-	length := len(buf)
-
-	for j := 0; j < length-1; j += 2 {
-		word := uint32(buf[j])<<8 | uint32(buf[j+1])
-		sum += word
-	}
-
-	if length%2 != 0 {
-		sum += uint32(buf[length-1]) << 8
-	}
-
-	for sum>>16 > 0 {
-		sum = (sum & 0xffff) + (sum >> 16)
-	}
-	return uint16(^sum)
-}
-
 func main() {
 	if len(os.Args) < 2 {
 		fmt.Println("Usage: sudo go run main.go <target_ip>")
 		return
 	}
+
+	targets := os.Args[1:]
 
 	fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_RAW, syscall.IPPROTO_ICMP)
 	if err != nil {
@@ -87,30 +52,16 @@ func main() {
 		return
 	}
 	defer syscall.Close(fd)
-
-	stats := &PingStats{}
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT)
-
+	stats := &PingStats{}
 	go func() {
 		<-sigChan
-
-		fmt.Printf("\n--- PING Statistics ---\n")
-		fmt.Printf("%d packets transmitted, %d received\n", stats.Transmitted, stats.Received)
-
-		if stats.Transmitted > 0 {
-			loss := ((stats.Transmitted - stats.Received) * 100) / stats.Transmitted
-			fmt.Printf("%d%% packet loss\n", loss)
-		}
-		if stats.Received > 0 {
-			avg := stats.TotalTime / time.Duration(stats.Received)
-			fmt.Printf("Average Round-Trip Time: %v\n", avg)
-		}
+		pingStatistics(stats)
 		os.Exit(0)
 	}()
 
-	stats.Transmitted++
-
+	// Receive the packets
 	go func() {
 		replybuf := make([]byte, 1500)
 		for {
@@ -140,8 +91,8 @@ func main() {
 				flight := val.(InFlightPacket)
 				flightTracker.Delete(recvSeq)
 				duration := recvTime.Sub(flight.SentAt)
-				stats.Received++
-				stats.TotalTime += duration
+				atomic.AddInt64(&stats.Received, 1)
+				atomic.AddInt64(&stats.TotalTime, int64(duration))
 				payload := icmpBytes[8:]
 
 				var srcIP string
@@ -151,11 +102,33 @@ func main() {
 
 				fmt.Printf("[REPLY] Found %-15s | rtt=%v data=%s", srcIP, duration, payload)
 			}
+			pingStatistics(stats)
 		}
 	}()
+
+	// Worker pool orchestration
+
+	numWorkers := 3
+	jobs := make(chan string, len(targets))
+	var wg sync.WaitGroup
+
+	for w := 1; w <= numWorkers; w++ {
+		wg.Add(1)
+		go pingWorker(w, fd, jobs, &wg, stats)
+	}
+
+	for _, target := range targets {
+		jobs <- target
+	}
+	close(jobs)
+	wg.Wait()
+
+	fmt.Println("\nAll IPs PINGED. Awaiting final reponse...")
+	time.Sleep(2 * time.Second)
 }
 
-func pingWorker(id int, fd int, jobs <-chan string, wg *sync.WaitGroup) {
+// Send Packets
+func pingWorker(id int, fd int, jobs <-chan string, wg *sync.WaitGroup, stats *PingStats) {
 	defer wg.Done()
 
 	for target := range jobs {
@@ -202,8 +175,65 @@ func pingWorker(id int, fd int, jobs <-chan string, wg *sync.WaitGroup) {
 		if err != nil {
 			fmt.Printf("[Worker %d] Error sending to %s: %v\n", id, target, err)
 			flightTracker.Delete(seq)
+			continue
 		}
-
+		atomic.AddInt64(&stats.Transmitted, 1)
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func (i *icmp) Seriliaze() []byte {
+	// RFC 792
+	rawBytes := make([]byte, 8+len(i.icmp_data))
+
+	rawBytes[0] = i.icmp_type
+	rawBytes[1] = i.icmp_code
+	binary.BigEndian.PutUint16(rawBytes[4:6], i.icmp_id)
+	binary.BigEndian.PutUint16(rawBytes[6:8], i.icmp_seq)
+	copy(rawBytes[8:], i.icmp_data)
+
+	i.icmp_checksum = i.calculateCheckSum(rawBytes)
+
+	binary.BigEndian.PutUint16(rawBytes[2:4], i.icmp_checksum)
+
+	return rawBytes
+}
+
+func (i *icmp) calculateCheckSum(buf []byte) uint16 {
+
+	var sum uint32
+	length := len(buf)
+
+	for j := 0; j < length-1; j += 2 {
+		word := uint32(buf[j])<<8 | uint32(buf[j+1])
+		sum += word
+	}
+
+	if length%2 != 0 {
+		sum += uint32(buf[length-1]) << 8
+	}
+
+	for sum>>16 > 0 {
+		sum = (sum & 0xffff) + (sum >> 16)
+	}
+	return uint16(^sum)
+}
+
+func pingStatistics(stats *PingStats) {
+
+	tx := atomic.LoadInt64(&stats.Transmitted)
+	rx := atomic.LoadInt64(&stats.Received)
+	totalNs := atomic.LoadInt64(&stats.TotalTime)
+
+	fmt.Printf("\n--- PING Statistics ---\n")
+	fmt.Printf("%d packets transmitted, %d received\n", stats.Transmitted, stats.Received)
+
+	if tx > 0 {
+		loss := ((tx - rx) * 100) / tx
+		fmt.Printf("%d%% packet loss\n", loss)
+	}
+	if rx > 0 {
+		avg := time.Duration(totalNs / rx)
+		fmt.Printf("Average Round-Trip Time: %v\n", avg)
 	}
 }
