@@ -14,6 +14,8 @@ import (
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/perf"
+	"golang.org/x/net/icmp"
+	"golang.org/x/net/ipv4"
 )
 
 type PingEvent struct {
@@ -23,8 +25,22 @@ type PingEvent struct {
 }
 
 func main() {
+	if len(os.Args) < 2 {
+		fmt.Println("USAGE: ping <ip_address>")
+		os.Exit(0)
+	}
+
 	stopper := make(chan os.Signal, 1)
 	signal.Notify(stopper, os.Interrupt, syscall.SIGTERM)
+
+	targetIp, err := net.LookupIP(os.Args[1])
+	if err != nil || len(targetIp) == 0 {
+		log.Fatalf("Error: Demanded target hostname '%s' could not be resolved: %v", os.Args[1], err)
+	}
+	dstIP := targetIp[0].To4()
+	if dstIP == nil {
+		log.Fatalf("Error: eBPF monitoring code currently only supports IPv4 targets.")
+	}
 
 	ifaceName := "wlp1s0"
 	iface, err := net.InterfaceByName(ifaceName)
@@ -92,6 +108,40 @@ func main() {
 		}
 	}()
 
+	fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_RAW, syscall.IPPROTO_ICMP)
+	if err != nil {
+		log.Fatalf("Privilege Error: Failed to open raw system network sockets: %v", err)
+	}
+	defer syscall.Close(fd)
+
+	var dstAddr syscall.SockaddrInet4
+	copy(dstAddr.Addr[:], dstIP)
+
+	fmt.Printf("EBPF-PING %s (%s) on %s interface:\n", targetIp[0], dstIP.String(), ifaceName)
+
+	seaqTracker := 1
+	for i := 0; i < 4; i++ {
+		echoMsg := icmp.Message{
+			Type: ipv4.ICMPTypeEcho,
+			Code: 0,
+			Body: &icmp.Echo{
+				ID:   os.Getpid() & 0xffff,
+				Seq:  seaqTracker,
+				Data: []byte("This is a ping request"),
+			},
+		}
+
+		binBytes, err := echoMsg.Marshal(nil)
+		if err != nil {
+			log.Printf("Internal error serializing packet layoutL %v", err)
+			continue
+		}
+
+		if err := syscall.Sendto(fd, binBytes, 0, &dstAddr); err != nil {
+			log.Printf("Network Error: Failed to broadcast packet sequence: %v", err)
+		}
+		seaqTracker++
+	}
 	<-stopper
 	fmt.Println("\nDetaching XDP program and exiting safely.")
 }
