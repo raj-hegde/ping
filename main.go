@@ -14,6 +14,7 @@ import (
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/perf"
+	"github.com/cilium/ebpf/rlimit"
 	"golang.org/x/net/icmp"
 	"golang.org/x/net/ipv4"
 )
@@ -25,6 +26,9 @@ type PingEvent struct {
 }
 
 func main() {
+	if err := rlimit.RemoveMemlock(); err != nil {
+		log.Fatalf("failed to remove memlock rlimit: %v", err)
+	}
 	if len(os.Args) < 2 {
 		fmt.Println("USAGE: ping <ip_address>")
 		os.Exit(0)
