@@ -38,6 +38,7 @@ func main() {
 		os.Exit(0)
 	}
 
+	var event PingEvent
 	stopper := make(chan os.Signal, 1)
 	signal.Notify(stopper, os.Interrupt, syscall.SIGTERM)
 
@@ -92,7 +93,6 @@ func main() {
 	defer rd.Close()
 
 	go func() {
-		var event PingEvent
 		for {
 			record, err := rd.Read()
 			if err != nil {
@@ -132,6 +132,8 @@ func main() {
 	for {
 		select {
 		case <-stopper:
+			fmt.Println("---PING Statistics---")
+			fmt.Printf("%d packets trasmitted %d packets received\n", seqTracker, event.Seq)
 			return
 		case <-ticker.C:
 			echoMsg := icmp.Message{
