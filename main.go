@@ -10,10 +10,11 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
-	"github.com/cilium/ebpf/perf"
+	"github.com/cilium/ebpf/ringbuf"
 	"github.com/cilium/ebpf/rlimit"
 	"golang.org/x/net/icmp"
 	"golang.org/x/net/ipv4"
@@ -81,7 +82,7 @@ func main() {
 
 	fmt.Printf("Successfully attached XDP program to %s. Listening for ICMP events....\n", ifaceName)
 
-	rd, err := perf.NewReader(objs.Events, os.Getpagesize())
+	rd, err := ringbuf.NewReader(objs.Events)
 	if err != nil {
 		log.Fatalf("failed to create perf ring buffer reader: %v", err)
 	}
@@ -92,17 +93,16 @@ func main() {
 		for {
 			record, err := rd.Read()
 			if err != nil {
-				if errors.Is(err, perf.ErrClosed) {
+				if errors.Is(err, ringbuf.ErrClosed) {
 					return
 				}
-				log.Printf("error reading from perf ring buffer: %v", err)
+				log.Printf("error reading from ring buffer: %v", err)
 				continue
 			}
 			if err := binary.Read(bytes.NewReader(record.RawSample), binary.LittleEndian, &event); err != nil {
 				log.Printf("failed to parse raw byte stream: %v", err)
 				continue
 			}
-
 			ipBytes := make([]byte, 4)
 			binary.LittleEndian.PutUint32(ipBytes, event.SrcIP)
 			srcIp := net.IP(ipBytes).String()
@@ -123,29 +123,39 @@ func main() {
 
 	fmt.Printf("EBPF-PING %s (%s) on %s interface:\n", targetIp[0], dstIP.String(), ifaceName)
 
-	seaqTracker := 1
+	seqTracker := 1
 	for i := 0; i < 4; i++ {
 		echoMsg := icmp.Message{
 			Type: ipv4.ICMPTypeEcho,
 			Code: 0,
 			Body: &icmp.Echo{
 				ID:   os.Getpid() & 0xffff,
-				Seq:  seaqTracker,
+				Seq:  seqTracker,
 				Data: []byte("This is a ping request"),
 			},
 		}
 
 		binBytes, err := echoMsg.Marshal(nil)
 		if err != nil {
-			log.Printf("Internal error serializing packet layoutL %v", err)
+			log.Printf("Internal error serializing packet layout %v", err)
 			continue
+		}
+		nowNs := uint64(time.Now().UnixNano())
+
+		u16Seq := uint16(seqTracker)
+		if err := objs.FlightTracker.Put(&u16Seq, &nowNs); err != nil {
+			log.Printf("Failed to populate tracking map state: %v", err)
 		}
 
 		if err := syscall.Sendto(fd, binBytes, 0, &dstAddr); err != nil {
 			log.Printf("Network Error: Failed to broadcast packet sequence: %v", err)
 		}
-		seaqTracker++
+		fmt.Printf("PING sent to %s (seq=%d)\n", os.Args[1], seqTracker)
+		seqTracker++
+		time.Sleep(1 * time.Second)
 	}
+	fmt.Println("All pings trasmitted")
+	time.Sleep(2 * time.Second)
 	<-stopper
 	fmt.Println("\nDetaching XDP program and exiting safely.")
 }
