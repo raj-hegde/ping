@@ -34,7 +34,6 @@ int monitor_icmp(struct xdp_md *ctx) {
   void *data = (void *)(long)ctx->data;
   struct ethhdr *eth = data;
   if ((void *)(eth + 1) > data_end) {
-    bpf_printk("[Debug] Failed Eth bounds\n");
     return XDP_PASS;
   }
 
@@ -43,7 +42,6 @@ int monitor_icmp(struct xdp_md *ctx) {
 
   struct iphdr *ip = data + sizeof(struct ethhdr);
   if ((void *)(ip + 1) > data_end) {
-    bpf_printk("[Debug] Failed ip bounds\n");
     return XDP_PASS;
   }
 
@@ -52,29 +50,21 @@ int monitor_icmp(struct xdp_md *ctx) {
 
   struct icmphdr *icmp = (void *)ip + (ip->ihl * 4);
   if ((void *)(icmp + 1) > data_end) {
-    bpf_printk("[Debug] Failed ICMP bounds\n");
     return XDP_PASS;
   }
 
-  __u64 now = bpf_ktime_get_ns();
   __u16 seq = bpf_ntohs(icmp->un.echo.sequence);
-  bpf_printk("now %llu, sequence %d", now, seq);
 
   if (icmp->type == ICMP_ECHOREPLY) {
     __u64 *start_ts = bpf_map_lookup_elem(&flight_tracker, &seq);
-    if (start_ts == NULL) {
-      return XDP_PASS;
+    if (start_ts != NULL) {
+      struct ping_event event = {};
+      event.src_ip = ip->saddr;
+      event.rtt_ns = bpf_ktime_get_ns() - *start_ts;
+      event.seq = seq;
+      bpf_ringbuf_output(&packet_events, &event, sizeof(event), 0);
+      bpf_map_delete_elem(&flight_tracker, &seq);
     }
-    bpf_printk("eBPF caught inbound ping! seq: %d\n", seq);
-    struct ping_event event = {};
-    event.src_ip = ip->saddr;
-    event.rtt_ns = now - *start_ts;
-    event.seq = seq;
-
-    long ret = bpf_ringbuf_output(&packet_events, &event, sizeof(event), 0);
-    bpf_printk("Ringbuf output triggered. Return code: %ld, Size: %d\n", ret,
-               sizeof(event));
-    bpf_map_delete_elem(&flight_tracker, &seq);
   }
   return XDP_PASS;
 }

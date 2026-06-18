@@ -11,6 +11,7 @@ import (
 	"os/signal"
 	"syscall"
 	"time"
+	"unsafe"
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
@@ -22,8 +23,10 @@ import (
 
 type PingEvent struct {
 	SrcIP uint32
+	_     uint32
 	RttNs uint64
 	Seq   uint16
+	_     [6]byte
 }
 
 func main() {
@@ -108,7 +111,7 @@ func main() {
 			srcIp := net.IP(ipBytes).String()
 			rttMs := float64(event.RttNs) / 1000000.0
 
-			fmt.Printf("[eBPF Trace] Reply from %s: seq=%d time=%.3f ms\n", srcIp, event.Seq, rttMs)
+			fmt.Printf("Reply from %s: seq=%d time=%v ms\n", srcIp, event.Seq, rttMs)
 		}
 	}()
 
@@ -124,38 +127,49 @@ func main() {
 	fmt.Printf("EBPF-PING %s (%s) on %s interface:\n", targetIp[0], dstIP.String(), ifaceName)
 
 	seqTracker := 1
-	for i := 0; i < 4; i++ {
-		echoMsg := icmp.Message{
-			Type: ipv4.ICMPTypeEcho,
-			Code: 0,
-			Body: &icmp.Echo{
-				ID:   os.Getpid() & 0xffff,
-				Seq:  seqTracker,
-				Data: []byte("This is a ping request"),
-			},
-		}
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-stopper:
+			return
+		case <-ticker.C:
+			echoMsg := icmp.Message{
+				Type: ipv4.ICMPTypeEcho,
+				Code: 0,
+				Body: &icmp.Echo{
+					ID:   os.Getpid() & 0xffff,
+					Seq:  seqTracker,
+					Data: []byte("This is a ping request"),
+				},
+			}
 
-		binBytes, err := echoMsg.Marshal(nil)
-		if err != nil {
-			log.Printf("Internal error serializing packet layout %v", err)
-			continue
-		}
-		nowNs := uint64(time.Now().UnixNano())
+			binBytes, err := echoMsg.Marshal(nil)
+			if err != nil {
+				log.Printf("Internal error serializing packet layout %v", err)
+				continue
+			}
+			nowNs := getMonotoniNs()
+			u16Seq := uint16(seqTracker)
+			if err := objs.FlightTracker.Put(&u16Seq, &nowNs); err != nil {
+				log.Printf("Failed to populate tracking map state: %v", err)
+			}
 
-		u16Seq := uint16(seqTracker)
-		if err := objs.FlightTracker.Put(&u16Seq, &nowNs); err != nil {
-			log.Printf("Failed to populate tracking map state: %v", err)
+			if err := syscall.Sendto(fd, binBytes, 0, &dstAddr); err != nil {
+				log.Printf("Network Error: Failed to broadcast packet sequence: %v", err)
+			}
+			seqTracker++
+			time.Sleep(1 * time.Second)
 		}
-
-		if err := syscall.Sendto(fd, binBytes, 0, &dstAddr); err != nil {
-			log.Printf("Network Error: Failed to broadcast packet sequence: %v", err)
-		}
-		fmt.Printf("PING sent to %s (seq=%d)\n", os.Args[1], seqTracker)
-		seqTracker++
-		time.Sleep(1 * time.Second)
 	}
-	fmt.Println("All pings trasmitted")
-	time.Sleep(2 * time.Second)
-	<-stopper
-	fmt.Println("\nDetaching XDP program and exiting safely.")
+	// fmt.Println("All pings trasmitted")
+	// time.Sleep(2 * time.Second)
+	// fmt.Println("\nDetaching XDP program and exiting safely.")
+}
+
+func getMonotoniNs() uint64 {
+	var tv syscall.Timespec
+
+	syscall.Syscall(syscall.SYS_CLOCK_GETTIME, 1, uintptr(unsafe.Pointer(&tv)), 0)
+	return uint64(tv.Sec)*1e9 + uint64(tv.Nsec)
 }
